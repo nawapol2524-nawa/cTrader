@@ -5,7 +5,6 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import logging
 
-# ตั้งค่า Logging ให้แสดงผลชัดเจนใน Console
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -14,40 +13,34 @@ app = FastAPI()
 # ---------------------------------------------------------------------------
 # ⚙️ 1. ตั้งค่าเชื่อมต่อ cTrader Remote MCP
 # ---------------------------------------------------------------------------
-# แนะนำให้ตั้งค่า CTRADER_MCP_TOKEN ใน Wispbyte (แท็บ Variables/Environment)
-# หากไม่ได้ตั้งค่า ให้แทนที่คำว่า "ใส่_TOKEN_ยาวๆ_ของคุณที่นี่" ด้วย Token จากหน้าจอ cTrader
-BEARER_TOKEN = os.environ.get("CTRADER_MCP_TOKEN", "eyJwbGFudCI6ImRlcml2IiwiZW52aXJvbm1lbnQiOiJkZW1vIiwidG9rZW4iOiJXKzBMK01aZThrL3NRUHd5VVZkc3N1cVRCNDRvWEdZQ1FJYk9kWkZWNDEwPSJ9")
 MCP_URL = "https://mcp.ctrader.com/trading/mcp"
+# ดึง Token จาก Environment Variables ของ Render หากไม่มีให้ใส่ตรงนี้เพื่อทดสอบ
+BEARER_TOKEN = os.environ.get(
+    "CTRADER_MCP_TOKEN", 
+    "eyJwbGFudCI6ImRlcml2IiwiZW52aXJvbm1lbnQiOiJkZW1vIiwidG9rZW4iOiJXKzBMK01aZThrL3NRUHd5VVZkc3N1cVRCNDRvWEdZQ1FJYk9kWkZWNDEwPSJ9"
+)
 
-# โครงสร้างข้อมูลที่คาดว่าจะได้รับจาก TradingView
 class WebhookPayload(BaseModel):
-    action: str      # "BUY" หรือ "SELL"
-    symbol: str      # "XAUUSD" หรือ "GBPUSD"
-    volume: float    # ขนาด Lot เช่น 0.01
+    action: str      
+    symbol: str      
+    volume: float    
 
 # ---------------------------------------------------------------------------
-# 🚀 2. ฟังก์ชันหลักสำหรับยิงออเดอร์เข้า cTrader MCP
+# 🚀 2. ฟังก์ชันยิงออเดอร์เข้า cTrader MCP
 # ---------------------------------------------------------------------------
 async def execute_mcp_order(action: str, symbol: str, volume: float):
-    if BEARER_TOKEN == "ใส่_TOKEN_ยาวๆ_ของคุณที่นี่":
-        logger.error("❌ ยังไม่ได้ใส่ Bearer Token! โปรดแก้ไขใน main.py หรือตั้งค่า Environment")
+    if not BEARER_TOKEN or BEARER_TOKEN == "ใส่_TOKEN_ยาวๆ_จาก_cTRADER_ที่นี่":
+        logger.error("❌ ยังไม่ได้ตั้งค่า CTRADER_MCP_TOKEN!")
         return False
 
-    # เตรียม Headers
     headers = {
         "Authorization": f"Bearer {BEARER_TOKEN}",
         "Content-Type": "application/json"
     }
     
-    # คำนวณ Volume: cTrader MCP มักใช้หน่วยเป็น Units
-    # (สมมติฐาน: 1 Lot = 100,000 Units สำหรับ Forex/Gold ส่วนใหญ่)
-    # *คุณอาจต้องปรับตัวคูณนี้หากเทรดคริปโตหรือหุ้น
     units = int(volume * 100000) 
-    
-    # ปรับ Format ของ Action ให้ตรงกับที่ระบบต้องการ ("Buy" หรือ "Sell")
     trade_type = "Buy" if action.upper() == "BUY" else "Sell"
 
-    # โครงสร้างคำสั่ง JSON-RPC สำหรับ Remote MCP
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -61,21 +54,23 @@ async def execute_mcp_order(action: str, symbol: str, volume: float):
 
     logger.info(f"📤 กำลังส่งคำสั่งไป cTrader: {trade_type} {symbol} จำนวน {units} Units")
     
-    # ยิง Request ไปยังเซิร์ฟเวอร์ของ cTrader
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(MCP_URL, headers=headers, json=payload, timeout=10.0)
             
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"✅ สำเร็จ! ผลลัพธ์จาก cTrader: {result}")
+                if "error" in result:
+                     logger.error(f"❌ cTrader ส่ง Error กลับมา: {result['error']}")
+                     return False
+                logger.info(f"✅ สำเร็จ! ผลลัพธ์: {result}")
                 return True
             else:
-                logger.error(f"❌ cTrader ปฏิเสธคำสั่ง! Status: {response.status_code}, แจ้งเตือน: {response.text}")
+                logger.error(f"❌ HTTP Error: {response.status_code} - {response.text}")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อ cTrader: {str(e)}")
+            logger.error(f"❌ เกิดข้อผิดพลาดในการส่งข้อมูล: {str(e)}")
             return False
 
 # ---------------------------------------------------------------------------
@@ -85,14 +80,12 @@ async def execute_mcp_order(action: str, symbol: str, volume: float):
 async def receive_webhook(payload: WebhookPayload):
     try:
         logger.info(f"🔔 TradingView แจ้งเตือนเข้ามา: {payload.action} {payload.symbol} Lot: {payload.volume}")
-        
-        # นำสัญญาณที่ได้ไปสั่งรัน cTrader
         success = await execute_mcp_order(payload.action, payload.symbol, payload.volume)
         
         if success:
             return {"status": "success", "message": f"Order {payload.action} executed for {payload.symbol}"}
         else:
-            raise HTTPException(status_code=500, detail="cTrader execution failed (Check server logs)")
+            raise HTTPException(status_code=500, detail="cTrader MCP execution failed")
             
     except Exception as e:
         logger.error(f"❌ Webhook Error: {str(e)}")
@@ -100,13 +93,13 @@ async def receive_webhook(payload: WebhookPayload):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "message": "Wispbyte Trading Bot + cTrader MCP is running 🚀"}
+    return {"status": "online", "message": "Render Trading Bot + cTrader MCP is running 🚀"}
 
 # ---------------------------------------------------------------------------
-# 🏁 4. คำสั่ง Start Server
+# 🏁 4. คำสั่ง Start Server สำหรับ Render
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # ดึง Port อัตโนมัติจากระบบ Wispbyte (ถ้าไม่มีใช้ 9848)
-    port = int(os.environ.get("SERVER_PORT", 9848))
+    # Render จะบังคับส่งหมายเลข PORT มาให้ใน Environment อัตโนมัติ
+    port = int(os.environ.get("PORT", 10000))
     logger.info(f"📡 บอทพร้อมทำงานที่พอร์ต {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
