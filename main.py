@@ -49,6 +49,8 @@ class ProtoOAPayloadType:
     PROTO_OA_EXECUTION_EVENT = 2126
     PROTO_OA_ORDER_ERROR_EVENT = 2132
     PROTO_OA_ERROR_RES = 2142
+    PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ = 2149
+    PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES = 2150
 
 
 class ProtoOATradeSide:
@@ -68,7 +70,7 @@ class ProtoOAOrderType:
 app = FastAPI(
     title="TradingView to cTrader Open API Bot",
     description="Webhook Server รับสัญญาณ TradingView และส่งคำสั่งตรงเข้า cTrader Open API V2",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 
@@ -113,7 +115,7 @@ def check_credentials():
 
 
 async def send_and_wait_response(ws, payload_type: int, payload: Dict[str, Any], timeout: float = 12.0) -> Dict[str, Any]:
-    """ส่งข้อความ JSON-RPC ไปยัง cTrader Open API และรอรับ Response ที่ตรงกัน"""
+    """ส่งข้อความ JSON ไปยัง cTrader Open API และรอรับ Response ที่ตรงกัน"""
     msg_id = f"req_{uuid.uuid4().hex[:8]}"
     request_msg = {
         "clientMsgId": msg_id,
@@ -150,10 +152,58 @@ async def send_and_wait_response(ws, payload_type: int, payload: Dict[str, Any],
         if response.get("clientMsgId") == msg_id or resp_type in (
             ProtoOAPayloadType.PROTO_OA_APPLICATION_AUTH_RES,
             ProtoOAPayloadType.PROTO_OA_ACCOUNT_AUTH_RES,
+            ProtoOAPayloadType.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES,
             ProtoOAPayloadType.PROTO_OA_SYMBOLS_LIST_RES,
             ProtoOAPayloadType.PROTO_OA_EXECUTION_EVENT,
         ):
             return response
+
+
+async def resolve_ctid_account_id(ws, target_account_str: str, access_token: str) -> int:
+    """
+    ดึงรายการบัญชีทั้งหมดที่ผูกกับ AccessToken และแปลงให้เป็น ctidTraderAccountId ที่ถูกต้อง
+    (รองรับทั้งผู้ใช้ที่ใส่ ctidTraderAccountId หรือใส่เลข Login/พอร์ต 2548625)
+    """
+    logger.info("🔍 [สเต็ป 3.1] ดึงรายการบัญชีทั้งหมดที่ผูกกับ AccessToken...")
+    resp = await send_and_wait_response(
+        ws,
+        ProtoOAPayloadType.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        {"accessToken": access_token},
+    )
+
+    accounts = resp.get("payload", {}).get("ctidTraderAccount", [])
+    target_clean = str(target_account_str).strip()
+
+    if not accounts:
+        logger.warning("⚠️ ไม่พบข้อมูลรายการบัญชีใน Token ใช้ค่าเดิม: %s", target_clean)
+        return int(target_clean)
+
+    logger.info("📋 พบบัญชีใน Access Token ทั้งหมด %d บัญชี:", len(accounts))
+    matched_id = None
+
+    for acc in accounts:
+        ctid_id = acc.get("ctidTraderAccountId")
+        trader_login = str(acc.get("traderLogin", ""))
+        is_live = acc.get("isLive", False)
+        env_type = "Live" if is_live else "Demo"
+        logger.info("   👉 ctidTraderAccountId: %s | Login ID: %s | ประเภท: %s", ctid_id, trader_login, env_type)
+
+        # ตรวจสอบว่าตรงกับ ctidTraderAccountId หรือ traderLogin
+        if str(ctid_id) == target_clean or trader_login == target_clean:
+            matched_id = ctid_id
+
+    if matched_id:
+        logger.info("🎯 พบการจับคู่บัญชีสำเร็จ! ใช้ ctidTraderAccountId: %d", matched_id)
+        return int(matched_id)
+
+    # หากมีบัญชีเดียวใน Token ให้เลือกใช้บัญชีนั้นโดยอัตโนมัติ
+    if len(accounts) == 1:
+        auto_id = accounts[0].get("ctidTraderAccountId")
+        logger.info("💡 ตรวจพบบัญชีเดียวใน Token -> เลือกใช้ ctidTraderAccountId: %d อัตโนมัติ", auto_id)
+        return int(auto_id)
+
+    logger.warning("⚠️ ไม่พบ ID ที่ระบุ (%s) ในรายการบัญชี จะลองใช้ค่านั้นโดยตรง", target_clean)
+    return int(target_clean)
 
 
 async def get_symbol_id(ws, symbol: str, account_id: int) -> int:
@@ -166,7 +216,7 @@ async def get_symbol_id(ws, symbol: str, account_id: int) -> int:
     if symbol.isdigit():
         return int(symbol)
 
-    logger.info("🔍 [3.1] กำลังค้นหารายชื่อ Symbol จาก cTrader สำหรับบัญชี %d...", account_id)
+    logger.info("🔍 [สเต็ป 4.1] ค้นหา Symbol ID สำหรับ %s ในบัญชี %d...", symbol, account_id)
     response = await send_and_wait_response(
         ws,
         ProtoOAPayloadType.PROTO_OA_SYMBOLS_LIST_REQ,
@@ -186,12 +236,12 @@ async def get_symbol_id(ws, symbol: str, account_id: int) -> int:
 
     if clean_target in SYMBOL_CACHE:
         found_id = SYMBOL_CACHE[clean_target]
-        logger.info("✅ [3.2] พบ Symbol ID สำหรับ '%s' คือ: %d", symbol, found_id)
+        logger.info("✅ [สเต็ป 4.2] พบ Symbol ID สำหรับ '%s' คือ: %d", symbol, found_id)
         return found_id
 
     for name, s_id in SYMBOL_CACHE.items():
         if clean_target in name or name in clean_target:
-            logger.info("✅ [3.2] พบ Symbol ID ใกล้เคียงสำหรับ '%s' -> '%s': %d", symbol, name, s_id)
+            logger.info("✅ [สเต็ป 4.2] พบ Symbol ID ใกล้เคียงสำหรับ '%s' -> '%s': %d", symbol, name, s_id)
             SYMBOL_CACHE[clean_target] = s_id
             return s_id
 
@@ -207,7 +257,6 @@ async def execute_ctrader_order(action: str, symbol: str, volume: float) -> Dict
     """
     check_credentials()
 
-    account_id_int = int(AccountID)
     action_upper = action.strip().upper()
     trade_side = ProtoOATradeSide.BUY if action_upper == "BUY" else ProtoOATradeSide.SELL
 
@@ -239,22 +288,25 @@ async def execute_ctrader_order(action: str, symbol: str, volume: float) -> Dict
             )
             logger.info("✅ [สเต็ป 2/5] App Authorization สำเร็จ!")
 
-            # 2. Account Authorization
-            logger.info("👤 [สเต็ป 3/5] กำลังส่ง Account Authorization (AccountID: %d)...", account_id_int)
+            # 2. ค้นหา ctidTraderAccountId ที่ถูกต้อง
+            target_account_id = await resolve_ctid_account_id(ws, AccountID, AccessToken)
+
+            # 3. Account Authorization
+            logger.info("👤 [สเต็ป 3/5] กำลังส่ง Account Authorization สำหรับ ctidTraderAccountId: %d...", target_account_id)
             await send_and_wait_response(
                 ws,
                 ProtoOAPayloadType.PROTO_OA_ACCOUNT_AUTH_REQ,
                 {
-                    "ctidTraderAccountId": account_id_int,
+                    "ctidTraderAccountId": target_account_id,
                     "accessToken": AccessToken,
                 },
             )
             logger.info("✅ [สเต็ป 3/5] Account Authorization สำเร็จ!")
 
-            # 3. ตรวจสอบ Symbol ID
-            symbol_id = await get_symbol_id(ws, symbol, account_id_int)
+            # 4. ตรวจสอบ Symbol ID
+            symbol_id = await get_symbol_id(ws, symbol, target_account_id)
 
-            # 4. ส่งคำสั่ง Market Order (ProtoOANewOrderReq)
+            # 5. ส่งคำสั่ง Market Order (ProtoOANewOrderReq)
             logger.info(
                 "📤 [สเต็ป 4/5] กำลังส่งคำสั่ง ProtoOANewOrderReq (Market Order): %s %s (Lot: %.2f | Cents: %d)...",
                 action_upper,
@@ -263,7 +315,7 @@ async def execute_ctrader_order(action: str, symbol: str, volume: float) -> Dict
                 volume_cents,
             )
             order_req_payload = {
-                "ctidTraderAccountId": account_id_int,
+                "ctidTraderAccountId": target_account_id,
                 "symbolId": symbol_id,
                 "orderType": ProtoOAOrderType.MARKET,
                 "tradeSide": trade_side,
@@ -276,7 +328,7 @@ async def execute_ctrader_order(action: str, symbol: str, volume: float) -> Dict
                 timeout=15.0,
             )
 
-            # 5. ดึงผลลัพธ์การเปิดออเดอร์
+            # 6. ดึงผลลัพธ์การเปิดออเดอร์
             resp_payload = order_response.get("payload", {})
             logger.info("🎉 [สเต็ป 5/5] ได้รับการยืนยันการเปิดออเดอร์สำเร็จจาก cTrader!")
             logger.info("📄 ผลลัพธ์: %s", json.dumps(resp_payload))
@@ -286,6 +338,7 @@ async def execute_ctrader_order(action: str, symbol: str, volume: float) -> Dict
                 "action": action_upper,
                 "symbol": symbol,
                 "symbolId": symbol_id,
+                "accountId": target_account_id,
                 "volume": volume,
                 "volumeCents": volume_cents,
                 "orderResult": resp_payload,
